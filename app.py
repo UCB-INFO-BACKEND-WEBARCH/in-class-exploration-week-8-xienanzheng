@@ -8,14 +8,19 @@ YOUR TASK: Convert this to use rq for background processing!
 """
 
 from flask import Flask, jsonify, request
+import os
 import time
 import uuid
 from datetime import datetime
+from redis import Redis
+from rq.job import Job
+from tasks import send_notification
 
 app = Flask(__name__)
 
 # In-memory store for notifications
 notifications = {}
+redis_conn = Redis.from_url(os.getenv('REDIS_URL', 'redis://localhost:6379/0'))
 
 
 def send_notification_sync(notification_id, email, message):
@@ -48,7 +53,8 @@ def index():
         "endpoints": {
             "POST /notifications": "Send a notification (takes 3 seconds!)",
             "GET /notifications": "List all notifications",
-            "GET /notifications/<id>": "Get a notification"
+            "GET /notifications/<id>": "Get a notification",
+            "GET /jobs/<job_id>": "Get job status"
         }
     })
 
@@ -75,18 +81,19 @@ def create_notification():
 
     # THIS IS THE PROBLEM: We block here for 3 seconds!
     # The user can't do anything while we wait.
-    result = send_notification_sync(notification_id, email, message)
+    # NOTE: This now queues a background job instead of blocking.
+    job = send_notification.delay(notification_id, email, message)
 
     notification = {
         "id": notification_id,
         "email": email,
         "message": message,
-        "status": result['status'],
-        "sent_at": result['sent_at']
+        "status": "queued",
+        "sent_at": None
     }
     notifications[notification_id] = notification
 
-    return jsonify(notification), 201
+    return jsonify({"job_id": job.id}), 202
 
 
 @app.route('/notifications', methods=['GET'])
@@ -104,6 +111,21 @@ def get_notification(notification_id):
     if not notification:
         return jsonify({"error": "Notification not found"}), 404
     return jsonify(notification)
+
+@app.route('/jobs/<job_id>', methods=['GET'])
+def get_job_status(job_id):
+    """Get job status and result."""
+    try:
+        job = Job.fetch(job_id, connection=redis_conn)
+    except Exception:
+        return jsonify({"error": "Job not found"}), 404
+
+    response = {
+        "job_id": job.id,
+        "status": job.get_status(),
+        "result": job.result
+    }
+    return jsonify(response)
 
 
 if __name__ == '__main__':
